@@ -1,13 +1,12 @@
 # chunk_pdf.py
-# Purpose: Load a PDF, extract its text, and split it into overlapping chunks
-# that are the right size for embedding and retrieval.
+# v2: Each chunk now carries metadata - page number and section guess
 
+import re # Regular expressions for simple section heading detection
 from pypdf import PdfReader #type: ignore  # The PDF text extraction library
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------------------------
-# Path to the PDF in our project folder. Change "document.pdf" to your filename.
 PDF_PATH = "document.pdf"
 
 # Chunk size and overlap, measured in CHARACTERS (not words or tokens).
@@ -21,13 +20,15 @@ CHUNK_OVERLAP = 150
 
 
 # ---------------------------------------------------------------------------
-# JOB 1: Extract all text from the PDF
+# JOB 1: Extract from the PDF
 # ---------------------------------------------------------------------------
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_pages_from_pdf(pdf_path: str) -> list[dict]:
     """
-    Open a PDF file and return all its text as one big string.
-    Pages are joined with a newline so the boundary is preserved
-    in case we want to inspect it later.
+    Returns a list like:
+        [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]
+
+    The key difference from v1: we DON'T join all pages into one string.
+    We keep them separate so each chunk can later be labeled with its page.
     """
     print(f"Opening PDF: {pdf_path}")
 
@@ -35,106 +36,155 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     reader = PdfReader(pdf_path)
 
     # reader.pages is a list-like object; len() gives total page count.
-    num_pages = len(reader.pages)
-    print(f"Total pages found: {num_pages}")
+    print(f"Total pages : {len(reader.pages)}")
 
-    # We'll collect each page's text in this list, then join at the end.
-    # Building a list and joining once is faster than concatenating strings
-    # in a loop — a small but real Python performance habit.
-    all_text_parts = []
+    pages = []
 
     for page_number, page in enumerate(reader.pages, start=1):
-        # extract_text() pulls out the text content from a single page.
-        # It can return None for pages that are blank or contain only images.
-        page_text = page.extract_text()
+        text = page.extract_text()
 
-        if page_text:
-            all_text_parts.append(page_text)
-            # Visibility: how much did this page contribute?
-            print(f"  Page {page_number}: extracted {len(page_text)} characters")
-        else:
-            print(f"  Page {page_number}: no extractable text (image-only?)")
+        if text and text.strip():  # Check if we got any non-whitespace text
+            pages.append({"page": page_number, "text": text})
+            print(f"  Page {page_number}: extracted {len(text)} characters")
 
-    # Join all pages into one big string separated by newlines.
-    full_text = "\n".join(all_text_parts)
 
-    print(f"\nTotal characters extracted: {len(full_text)}")
-    return full_text
+    return pages
+
+
+# Common section names found in research papers, manuals, reports.
+# Each entry is a regex pattern that will match a section header line.
+SECTION_PATTERNS = [
+    # Allow optional leading numbers like "1 Introduction" or "3.2 Methods".
+    # The pattern (?:\d+(?:\.\d+)?\s+)? means:
+    #   - optional digit(s),
+    #   - optional ".digit(s)" for subsections,
+    #   - followed by whitespace.
+    r"^(?:\d+(?:\.\d+)?\s+)?abstract$",
+    r"^(?:\d+(?:\.\d+)?\s+)?introduction$",
+    r"^(?:\d+(?:\.\d+)?\s+)?background$",
+    r"^(?:\d+(?:\.\d+)?\s+)?related work$",
+    r"^(?:\d+(?:\.\d+)?\s+)?methods?$",
+    r"^(?:\d+(?:\.\d+)?\s+)?methodology$",
+    r"^(?:\d+(?:\.\d+)?\s+)?model architecture$",
+    r"^(?:\d+(?:\.\d+)?\s+)?architecture$",
+    r"^(?:\d+(?:\.\d+)?\s+)?experiments?$",
+    r"^(?:\d+(?:\.\d+)?\s+)?results?$",
+    r"^(?:\d+(?:\.\d+)?\s+)?evaluation$",
+    r"^(?:\d+(?:\.\d+)?\s+)?training$",
+    r"^(?:\d+(?:\.\d+)?\s+)?discussion$",
+    r"^(?:\d+(?:\.\d+)?\s+)?conclusion$",
+    r"^(?:\d+(?:\.\d+)?\s+)?why self-attention$",
+    r"^(?:\d+(?:\.\d+)?\s+)?references?$",
+    r"^(?:\d+(?:\.\d+)?\s+)?bibliography$",
+    r"^(?:\d+(?:\.\d+)?\s+)?acknowledgements?$",
+    r"^(?:\d+(?:\.\d+)?\s+)?appendix$",
+]
+# Pre-compile all patterns into one combined regex. re.IGNORECASE lets
+# "Methods" / "METHODS" / "methods" all match the same pattern.
+SECTION_REGEX = re.compile("|".join(SECTION_PATTERNS), re.IGNORECASE)
+
+
+def guess_section(text_so_far: str) -> str:
+    """
+    Look at all the text we've seen up to a point in the document and find
+    the most recent line that looks like a section header.
+    Returns "body" if no header has appeared yet.
+    """
+    # Split the text into lines and walk backwards from the end.
+    # The first header we find while walking backwards is the most recent.
+    lines = text_so_far.split("\n")
+    for line in reversed(lines):
+        stripped = line.strip().lower()
+
+        # A section header is usually short (<50 chars) and matches one of
+        # our patterns. The length check prevents false matches like
+        # "we present a new method for..." being tagged as "method".
+        if 0 < len(stripped) < 50 and SECTION_REGEX.match(stripped):
+            return stripped
+
+    return "body"
 
 
 # ---------------------------------------------------------------------------
-# JOB 2: Split the text into overlapping chunks
-# ---------------------------------------------------------------------------
-def split_into_chunks(text: str, chunk_size: int, overlap: int) -> list[str]:
+def chunk_with_metadata(pages: list[dict], chunk_size: int, overlap: int) -> list[dict]:
     """
-    Cut the text into overlapping windows.
-
-    Imagine a window of size `chunk_size` sliding across the text.
-    After each chunk, the window doesn't jump forward by its full width —
-    it backs up by `overlap` characters so the next chunk starts inside
-    the previous one. That overlapping region is the "context bridge."
+    Slide a window across the document, attaching page + section to each chunk.
+    Returns: list of dicts like:
+      {"text": "...", "page": 3, "section": "introduction", "chunk_index": 7}
     """
-    print(f"\nSplitting text into chunks (size={chunk_size}, overlap={overlap})...")
+    print(f"\nChunking with metadata (size={chunk_size}, overlap={overlap})...")
 
-    chunks = []          # List that will hold each chunk string
-    start = 0            # Current window's start position in the text
-    text_length = len(text)
+    # Step 1: Build one big text stream + remember where each page starts.
+    # We need the joined text for chunking, but we ALSO need a way to map
+    # "character position 4823" back to "this is page 3" later.
+    full_text_parts = []
+    page_boundaries = []      # list of (char_position_where_page_starts, page_number)
+    char_position = 0
 
-    # Keep sliding the window until we've gone past the end of the text.
+    for page in pages:
+        page_boundaries.append((char_position, page["page"]))
+        full_text_parts.append(page["text"])
+        char_position += len(page["text"]) + 1   # +1 for the "\n" we add when joining
+
+    full_text = "\n".join(full_text_parts)
+
+    # Step 2: Helper that converts a character position to a page number.
+    def char_pos_to_page(pos: int) -> int:
+        page = page_boundaries[0][1]
+        for boundary_pos, page_num in page_boundaries:
+            if pos >= boundary_pos:
+                page = page_num
+            else:
+                break
+        return page
+
+    # Step 3: The chunking loop, same as v1 but now attaching metadata.
+    chunks = []
+    start = 0
+    chunk_index = 0
+    text_length = len(full_text)
+
     while start < text_length:
-        # End of this window. min() prevents going past the end of the string
-        # for the final chunk, which may be shorter than chunk_size.
         end = min(start + chunk_size, text_length)
+        chunk_text = full_text[start:end].strip()
 
-        # Slice out this chunk and clean up surrounding whitespace.
-        chunk = text[start:end].strip()
+        if chunk_text:
+            page = char_pos_to_page(start)              # which page did this chunk start on?
+            section = guess_section(full_text[:start])  # what section came before this chunk?
 
-        # Skip any chunks that turned out empty (can happen with weird PDFs
-        # full of whitespace). A chunk of pure spaces is useless to embed.
-        if chunk:
-            chunks.append(chunk)
+            chunks.append({
+                "text": chunk_text,
+                "page": page,
+                "section": section,
+                "chunk_index": chunk_index,
+            })
+            chunk_index += 1
 
-        # Move the window forward by (chunk_size - overlap).
-        # Example: size=1000, overlap=150 → window jumps forward 850 chars.
-        # The next chunk's first 150 chars are the previous chunk's last 150.
         start += chunk_size - overlap
 
-    print(f"Total chunks created: {len(chunks)}")
+    print(f"Total chunks: {len(chunks)}")
+
+    # Show section distribution so you can sanity-check the labels look reasonable.
+    section_counts = {}
+    for c in chunks:
+        section_counts[c["section"]] = section_counts.get(c["section"], 0) + 1
+
+    print("\nSection distribution:")
+    for section, count in sorted(section_counts.items(), key=lambda x: -x[1]):
+        print(f"  {section:25s} → {count} chunks")
+
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# RUN IT
-# ---------------------------------------------------------------------------
+# Optional: quick standalone test.
 if __name__ == "__main__":
-    # Step 1: PDF → text
-    full_text = extract_text_from_pdf(PDF_PATH)
+    pages = extract_pages_from_pdf(PDF_PATH)
+    chunks = chunk_with_metadata(pages, CHUNK_SIZE, CHUNK_OVERLAP)
 
-    # Step 2: text → chunks
-    chunks = split_into_chunks(full_text, CHUNK_SIZE, CHUNK_OVERLAP)
-
-    # Step 3: Visibility — show what we built so you can SEE the chunks.
-    # We don't print all of them (could be hundreds), just the first 3
-    # and the last one, plus some stats.
     print("\n" + "=" * 70)
-    print("PREVIEW OF CHUNKS")
+    print("SAMPLE CHUNKS WITH METADATA")
     print("=" * 70)
-
-    for i in range(min(3, len(chunks))):
-        print(f"\n--- Chunk {i} (length: {len(chunks[i])} chars) ---")
-        print(chunks[i][:300] + ("..." if len(chunks[i]) > 300 else ""))
-
-    if len(chunks) > 3:
-        print(f"\n--- Chunk {len(chunks) - 1} (last chunk, length: {len(chunks[-1])} chars) ---")
-        print((chunks[-1])[:300] + ("..." if len(chunks[-1]) > 300 else ""))
-
-    # Step 4: Confirm overlap visually.
-    # The last 50 chars of chunk[0] should equal the first 50 chars
-    # of chunk[1] (approximately — strip() may have shifted things slightly).
-    if len(chunks) >= 2:
-        print("\n" + "=" * 70)
-        print("OVERLAP CHECK")
-        print("=" * 70)
-        print(f"End of chunk 0:   ...{chunks[0][-80:]!r}")
-        print(f"Start of chunk 1: {chunks[1][:80]!r}...")
-        print("(These should share roughly the same words.)")
+    for i in [0, len(chunks) // 4, len(chunks) // 2, -1]:
+        c = chunks[i]
+        print(f"\n--- Chunk {c['chunk_index']} | page={c['page']} | section={c['section']} ---")
+        print(c["text"][:200] + "...")

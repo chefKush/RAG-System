@@ -1,13 +1,10 @@
 # index_pdf.py
-# Purpose: ONE-TIME job — chunk the PDF, embed every chunk, store everything
-# in a ChromaDB collection persisted to disk. After this runs once, the DB
-# is ready to be queried by query_db.py as many times as we want.
 
 import chromadb                                       # The vector database
 from sentence_transformers import SentenceTransformer #type: ignore  # The embedding library
 
 # Reuse the chunking functions we built in Stage 2 — DRY principle.
-from chunk_pdf import extract_text_from_pdf, split_into_chunks
+from chunk_pdf import extract_pages_from_pdf, chunk_with_metadata
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION
@@ -35,13 +32,13 @@ print(f"Connecting to ChromaDB at: ./{CHROMA_DB_DIR}/")
 client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
 
 
-# ---------------------------------------------------------------------------
-# Step 2: Get or create the collection
-# ---------------------------------------------------------------------------
-# If we re-run this script, we DON'T want duplicate chunks piling up. So we
-# delete any existing collection with the same name and create a fresh one.
-# In production you'd handle this more carefully (e.g., upserts by ID),
-# but for learning a clean reset is clearer.
+# Check if a collection with our name already exists from a previous run.
+# list_collections() returns a list of Collection objects.
+# [c.name for c in ...] is a list comprehension that pulls just the names.
+#
+# Example: if you ran this script yesterday, list_collections() might return
+# Collection objects whose .name values are ["pdf_chunks"].
+# We extract just the names into a plain list to check membership.
 existing = [c.name for c in client.list_collections()]
 if COLLECTION_NAME in existing:
     print(f"Collection '{COLLECTION_NAME}' already exists — deleting it for a clean rebuild.")
@@ -49,8 +46,7 @@ if COLLECTION_NAME in existing:
 
 # Create the collection.
 # metadata={"hnsw:space": "cosine"} tells Chroma to use cosine similarity
-# for distance calculations — matches what we learned in Stage 3.
-# Without this, Chroma defaults to L2 (Euclidean) which behaves differently.
+# (measures angle between vectors - matches what we want for embeddings).
 collection = client.create_collection(
     name=COLLECTION_NAME,
     metadata={"hnsw:space": "cosine"}, #Hierarchical Navigable Small World
@@ -59,71 +55,122 @@ print(f"Created fresh collection: {COLLECTION_NAME}")
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Chunk the PDF (Stage 2 logic, reused)
+# Step 2: use the new v2 functoons to get chunks with metadata attached
 # ---------------------------------------------------------------------------
-print("\n--- Chunking PDF ---")
-full_text = extract_text_from_pdf(PDF_PATH)
-chunks = split_into_chunks(full_text, CHUNK_SIZE, CHUNK_OVERLAP)
+print("\n--- Chunking PDF with metadata ---")
+# extract_pages_from_pdf returns: [{"page": 1, "text": "..."}, {"page": 2, "text": "..."}, ...]
+# (Pages kept separate so we can track page numbers per chunk.)
+pages = extract_pages_from_pdf(PDF_PATH)
+
+# chunk_with_metadata returns:
+# [{"text": "...", "page": 4, "section": "abstract", "chunk_index": 0}, ...]
+# Each chunk is now a DICT with text + metadata, not just a plain string.
+chunks = chunk_with_metadata(pages, CHUNK_SIZE, CHUNK_OVERLAP)
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Embed all chunks (Stage 3 logic, reused)
+# Step 3: Embed each chunk's text using sentence-transformers
 # ---------------------------------------------------------------------------
 print(f"\n--- Loading embedding model: {EMBEDDING_MODEL} ---")
 model = SentenceTransformer(EMBEDDING_MODEL)
 
-print(f"\n--- Embedding {len(chunks)} chunks ---")
-embeddings = model.encode(chunks, show_progress_bar=True)
+# Our chunks are dicts like {"text": "...", "page": 4, ...}.
+# But the embedding model only wants TEXT, not metadata.
+# So we extract just the "text" field from each chunk into a separate list.
+#
+# This [c["text"] for c in chunks] is called a LIST COMPREHENSION.
+# It's a one-line way to build a new list by transforming each item in another list.
+#
+# Example with 2 chunks:
+#   chunks = [{"text": "hello", "page": 1}, {"text": "world", "page": 2}]
+#   chunk_texts = ["hello", "world"]
+#
+# Equivalent long version:
+#   chunk_texts = []
+#   for c in chunks:
+#       chunk_texts.append(c["text"])
+chunk_texts = [c["text"] for c in chunks]
 
-# ChromaDB wants embeddings as a list of lists (not a numpy array).
-# .tolist() converts cleanly.
+print(f"\n--- Embedding {len(chunks)} chunks ---")
+embeddings = model.encode(chunk_texts, show_progress_bar=True)
+
+# embeddings is a NumPy array of shape (num_chunks, 384).
+# ChromaDB wants a plain Python list-of-lists, so we convert with .tolist().
+#
+# Example:
+#   NumPy array: [[0.1, 0.2, ...], [0.3, 0.4, ...]]
+#   After .tolist(): [[0.1, 0.2, ...], [0.3, 0.4, ...]]
+# (Looks the same when printed, but the underlying type changed.)
 embeddings_list = embeddings.tolist()
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Add everything to ChromaDB
+# Step 4: Build the metadata dict from each chunk
 # ---------------------------------------------------------------------------
-# Chroma's add() takes four parallel lists, each with one entry per chunk:
-#   ids        → unique string ID for each vector (we'll use "chunk_0", etc.)
+# Chroma's add() takes 4 parallel lists, all the same length.
+#   ids        → unique ID per chunk
 #   embeddings → the 384-dim vectors
-#   documents  → the original text (so we can retrieve it later)
-#   metadatas  → arbitrary extra info per chunk (source, position, etc.)
+#   documents  → the text per chunk
+#   metadatas  → a dict of metadata per chunk - this is v2 upgrade)
 #
-# Note: Chroma stores the text alongside the vector — so when we query,
-# we get the text BACK automatically. No second lookup needed. Convenient.
+# IDs: just unique strings. "chunk_0", "chunk_1", etc.
+#
+# Example: for 3 chunks, ids = ["chunk_0", "chunk_1", "chunk_2"]
+ids = [f"chunk_{c['chunk_index']}" for c in chunks]
 
-ids = [f"chunk_{i}" for i in range(len(chunks))]
-
+# Metadatas: one dict per chunk. IMPORTANT RULE — values must be primitives
+# (str, int, float, bool). No lists or nested dicts.
+#
+# Example for one chunk:
+#   {
+#     "source": "document.pdf",     # str
+#     "page": 4,                    # int
+#     "section": "abstract",        # str
+#     "chunk_index": 0,             # int
+#     "chunk_length": 998,          # int
+#   }
 metadatas = [
     {
         "source": PDF_PATH,
-        "chunk_index": i,
-        "chunk_length": len(chunks[i]),
+        "page": c["page"],
+        "section": c["section"],
+        "chunk_index": c["chunk_index"],
+        "chunk_length": len(c["text"]),
     }
-    for i in range(len(chunks))
+    for c in chunks
 ]
 
+# Step 5: Insert everything into ChromaDB in one call
 print(f"\n--- Adding {len(chunks)} chunks to ChromaDB ---")
 collection.add(
     ids=ids,
     embeddings=embeddings_list,
-    documents=chunks,
+    documents=chunk_texts,
     metadatas=metadatas,
 )
 
+print(f"\n✅ Indexed {collection.count()} chunk with metadata.")
 
 # ---------------------------------------------------------------------------
-# Step 6: Verify what we stored
-# ---------------------------------------------------------------------------
-count = collection.count()
-print(f"\n✅ Collection now contains {count} vectors.")
-print(f"✅ Database persisted to: ./{CHROMA_DB_DIR}/")
-print("\nYou can now run query_db.py without re-running this script.") 
+# Step 6: Sanity check — pull 3 items back out of the DB to verify
+# the metadata actually made it in correctly.
+print("\n--- Sample stored items ---")
 
+# collection.get(limit=3, include=["metadatas", "documents"]) returns:
+#   {
+#     "ids": ["chunk_0", "chunk_1", "chunk_2"],
+#     "documents": ["text of chunk 0", "text of chunk 1", "text of chunk 2"],
+#     "metadatas": [{"page": 1, ...}, {"page": 1, ...}, {"page": 2, ...}]
+#   }
+sample = collection.get(limit=3, include=["metadatas", "documents"])
 
-"""
-data_level0.bin       ← The actual 384-dim embedding vectors
-header.bin            ← HNSW index header
-length.bin            ← Vector count metadata
-link_lists.bin        ← HNSW graph connections between vectors
-"""
+# zip(list1, list2) pairs up items at the same index from two lists.
+# Example: zip(["A", "B"], [1, 2]) gives us [("A", 1), ("B", 2)]
+# enumerate() adds a counter starting from 0.
+# So this loop iterates:
+#   i=0, doc="text 0", meta={"page": 1, ...}
+#   i=1, doc="text 1", meta={"page": 1, ...}
+#   i=2, doc="text 2", meta={"page": 2, ...}
+for i, (doc, meta) in enumerate(zip(sample["documents"], sample["metadatas"])):
+    print(f"\nItem {i}: page={meta['page']}, section={meta['section']}")
+    print(f"  Text preview: {doc[:120]}...")
