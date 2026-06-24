@@ -3,7 +3,7 @@
 # Now supports optional metadata filters so we can scope searches
 # to specific sections, pages, or documents.
 
-import chromadb
+import chromadb # type: ignore
 from sentence_transformers import SentenceTransformer #type: ignore
 
 CHROMA_DB_DIR = "chroma_db"
@@ -170,3 +170,14 @@ if __name__ == "__main__":
             ]
         },
     )
+
+    # ---- Demo 5: The vague question test — where filtering really shines ----
+print("\n\n>>> DEMO 5a: 'What is this document about?' — NO FILTER")
+retrieve("What is this document about?", top_k=3)
+
+print("\n\n>>> DEMO 5b: 'What is this document about?' — EXCLUDE references")
+retrieve(
+    "What is this document about?",
+    top_k=3,
+    where={"section": {"$nin": ["references", "bibliography"]}},
+)
